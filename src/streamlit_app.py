@@ -1,0 +1,436 @@
+"""
+Streamlit web app for NBA player performance predictions
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from simple_model import SimplePredictor
+from database import get_session, Player, GameStats
+from data_collector import NBADataCollector
+import numpy as np
+from datetime import datetime, timedelta
+from sqlalchemy import desc
+
+# Page configuration
+st.set_page_config(
+    page_title="NBA Player Performance Predictor",
+    page_icon="🏀",
+    layout="wide"
+)
+
+# Title
+st.title("🏀 NBA Player Performance Predictor")
+st.markdown("### Advanced predictions using moving averages and defensive adjustments")
+
+# Auto-update function
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def check_and_update_data():
+    """Check if data needs updating and fetch new games if necessary"""
+    session = get_session()
+
+    try:
+        # Get the most recent game date in the database
+        most_recent_game = session.query(GameStats).order_by(desc(GameStats.game_date)).first()
+
+        if most_recent_game:
+            most_recent_date = most_recent_game.game_date
+            days_since_update = (datetime.now().date() - most_recent_date).days
+
+            # If data is more than 1 day old, update it
+            if days_since_update >= 1:
+                return True, f"Data is {days_since_update} days old"
+        else:
+            return True, "No data in database"
+
+        return False, f"Data is up to date (last game: {most_recent_date})"
+    finally:
+        session.close()
+
+def update_player_data(player_name):
+    """Update data for a specific player"""
+    try:
+        collector = NBADataCollector()
+        # Use current season (2025-26 is the current NBA season)
+        collector.fetch_player_game_stats(player_name, season='2025-26', max_games=30)
+        collector.close()
+        return True
+    except Exception as e:
+        st.error(f"Error updating data: {e}")
+        return False
+
+# Sidebar for inputs
+st.sidebar.header("Prediction Settings")
+
+# Data status and refresh
+needs_update, update_message = check_and_update_data()
+if needs_update:
+    st.sidebar.warning(f"⚠️ {update_message}")
+else:
+    st.sidebar.success(f"✅ {update_message}")
+
+# Get list of players from database
+@st.cache_resource
+def get_players_list():
+    session = get_session()
+    players = session.query(Player).order_by(Player.name).all()
+    player_names = [p.name for p in players]
+    session.close()
+    return player_names
+
+# Get list of teams from database
+@st.cache_resource
+def get_teams_list():
+    from database import Team
+    session = get_session()
+    teams = session.query(Team).order_by(Team.abbreviation).all()
+    # Return dict mapping display name to abbreviation
+    team_options = {f"{t.abbreviation} - {t.name}": t.abbreviation for t in teams}
+    session.close()
+    return team_options
+
+# Calculate league average defensive rating
+@st.cache_data(ttl=3600)
+def get_league_average_def_rating():
+    """Calculate current league average defensive rating from database"""
+    from database import TeamDefensiveStats
+    session = get_session()
+
+    try:
+        # Get all defensive ratings
+        teams = session.query(TeamDefensiveStats).all()
+        ratings = [t.def_rating for t in teams if t.def_rating is not None]
+
+        if ratings:
+            league_avg = sum(ratings) / len(ratings)
+            return round(league_avg, 1)
+        else:
+            return 112.0  # Default fallback
+    finally:
+        session.close()
+
+player_names = get_players_list()
+teams_dict = get_teams_list()
+league_avg_def = get_league_average_def_rating()
+
+# Player selection
+player_name = st.sidebar.selectbox(
+    "Select Player",
+    options=player_names,
+    index=0 if player_names else None
+)
+
+# Refresh button for selected player
+if st.sidebar.button("🔄 Refresh Player Data"):
+    with st.spinner(f"Updating data for {player_name}..."):
+        if update_player_data(player_name):
+            st.sidebar.success(f"✅ Updated data for {player_name}")
+            st.cache_data.clear()  # Clear cache to show new data
+            st.rerun()
+        else:
+            st.sidebar.error("Failed to update data")
+
+# Opponent Team Selection (moved to main sidebar - more prominent)
+st.sidebar.subheader("🏀 Opponent Team")
+if teams_dict:
+    opponent_selection = st.sidebar.selectbox(
+        "Who are they playing against?",
+        options=["None"] + list(teams_dict.keys()),
+        index=0,
+        help="Adjusts prediction based on opponent's defensive strength vs league average"
+    )
+    opponent_name = teams_dict[opponent_selection] if opponent_selection != "None" else None
+
+    # Show info about defensive adjustment when opponent is selected
+    if opponent_name and opponent_name != "None":
+        from database import Team, TeamDefensiveStats
+        session = get_session()
+        team = session.query(Team).filter_by(abbreviation=opponent_name).first()
+        if team:
+            def_stats = session.query(TeamDefensiveStats).filter_by(team_id=team.id).first()
+            if def_stats and def_stats.def_rating:
+                diff = def_stats.def_rating - league_avg_def
+                if diff > 0:
+                    st.sidebar.info(f"📊 {team.name} allows {def_stats.def_rating:.1f} pts/game ({diff:+.1f} vs league avg) - Easier matchup!")
+                else:
+                    st.sidebar.info(f"📊 {team.name} allows {def_stats.def_rating:.1f} pts/game ({diff:+.1f} vs league avg) - Tougher matchup!")
+        session.close()
+else:
+    st.sidebar.warning("No teams in database. Run setup_teams.py first!")
+    opponent_name = None
+
+# Stat type selection
+stat_type = st.sidebar.selectbox(
+    "Stat Type",
+    options=['points', 'rebounds', 'assists'],
+    index=0
+)
+
+# Lookback games
+lookback_games = st.sidebar.slider(
+    "Number of Recent Games",
+    min_value=3,
+    max_value=20,
+    value=10,
+    help="How many recent games to analyze"
+)
+
+# Decay factor
+decay_factor = st.sidebar.slider(
+    "Decay Factor",
+    min_value=0.7,
+    max_value=1.0,
+    value=0.9,
+    step=0.05,
+    help="Weight for recent games (higher = more weight on recent games)"
+)
+
+# Auto-calculate days of rest from most recent game
+def get_days_since_last_game(player_name):
+    """Calculate days since player's last game"""
+    session = get_session()
+    try:
+        player = session.query(Player).filter_by(name=player_name).first()
+        if player:
+            most_recent = session.query(GameStats)\
+                .filter_by(player_id=player.id)\
+                .order_by(desc(GameStats.game_date))\
+                .first()
+            if most_recent:
+                days_since = (datetime.now().date() - most_recent.game_date).days - 1
+                return max(0, days_since)  # Can't be negative
+    except:
+        pass
+    finally:
+        session.close()
+    return None
+
+# Calculate days of rest automatically
+auto_days_rest = get_days_since_last_game(player_name)
+
+# Advanced options
+with st.sidebar.expander("Advanced Options"):
+    # Days of rest with auto-calculated default
+    if auto_days_rest is not None:
+        st.info(f"Auto-detected: {auto_days_rest} days since last game")
+        override_rest = st.checkbox("Override days of rest", value=False)
+        if override_rest:
+            days_rest = st.number_input(
+                "Custom Days of Rest",
+                min_value=0,
+                max_value=7,
+                value=auto_days_rest,
+                step=1,
+                help="Days since last game (0 = back-to-back)"
+            )
+        else:
+            days_rest = auto_days_rest
+    else:
+        days_rest = st.number_input(
+            "Days of Rest (optional)",
+            min_value=0,
+            max_value=7,
+            value=None,
+            step=1,
+            help="Days since last game (0 = back-to-back)"
+        )
+
+    # Show calculated league average (just for reference)
+    st.markdown(f"**League Avg Defensive Rating:** {league_avg_def} pts/game")
+    st.caption("Used as baseline for opponent adjustments")
+    league_avg = league_avg_def
+
+    line = st.number_input(
+        "PrizePicks Line (optional)",
+        min_value=0.0,
+        value=None,
+        step=0.5,
+        help="Set to enable betting analysis"
+    )
+
+# Run prediction button
+if st.sidebar.button("🔮 Generate Prediction", type="primary"):
+    with st.spinner("Analyzing player performance..."):
+        # Initialize predictor
+        predictor = SimplePredictor(stat_type=stat_type, lookback_games=lookback_games)
+
+        # Get recent stats
+        recent_stats = predictor.get_player_recent_stats(player_name)
+
+        if recent_stats is None or recent_stats.empty:
+            st.error(f"No data available for {player_name}")
+            predictor.close()
+        else:
+            # Get predictions
+            simple_pred, simple_std, _ = predictor.predict_simple_average(player_name, decay=decay_factor)
+            weighted_pred, weighted_std, _ = predictor.predict_weighted_average(player_name, decay_factor=decay_factor)
+
+            # Apply adjustments
+            final_pred = weighted_pred
+            adjustments_applied = []
+
+            if opponent_name:
+                adjusted = predictor.apply_opponent_adjustment(final_pred, opponent_name, league_avg)
+                if adjusted != final_pred:
+                    adjustments_applied.append(f"Opponent: {opponent_name}")
+                    final_pred = adjusted
+
+            if days_rest is not None:
+                adjusted = predictor.apply_rest_adjustment(final_pred, days_rest)
+                if adjusted != final_pred:
+                    rest_desc = {0: "Back-to-back", 1: "1 day", 2: "2 days (optimal)", 3: "3 days", 4: "4+ days"}.get(min(days_rest, 4))
+                    adjustments_applied.append(f"Rest: {rest_desc}")
+                    final_pred = adjusted
+
+            # Display results
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric(
+                    label="Simple Average",
+                    value=f"{simple_pred:.2f}",
+                    delta=f"± {simple_std:.2f}"
+                )
+
+            with col2:
+                st.metric(
+                    label="Weighted Average",
+                    value=f"{weighted_pred:.2f}",
+                    delta=f"± {weighted_std:.2f}"
+                )
+
+            with col3:
+                delta_val = final_pred - weighted_pred if adjustments_applied else None
+                st.metric(
+                    label="Final Prediction",
+                    value=f"{final_pred:.2f}",
+                    delta=f"{delta_val:+.2f}" if delta_val else None
+                )
+
+            if adjustments_applied:
+                st.info(f"**Adjustments Applied:** {', '.join(adjustments_applied)}")
+
+            # Recent games chart
+            st.subheader(f"Recent {len(recent_stats)} Games Performance")
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=list(range(len(recent_stats), 0, -1)),
+                y=recent_stats[stat_type],
+                mode='lines+markers',
+                name='Actual',
+                line=dict(color='#1f77b4', width=2),
+                marker=dict(size=8)
+            ))
+
+            # Add prediction line
+            fig.add_hline(
+                y=final_pred,
+                line_dash="dash",
+                line_color="green",
+                annotation_text=f"Prediction: {final_pred:.2f}",
+                annotation_position="right"
+            )
+
+            # Add confidence interval
+            fig.add_hrect(
+                y0=final_pred - weighted_std,
+                y1=final_pred + weighted_std,
+                fillcolor="green",
+                opacity=0.1,
+                line_width=0,
+                annotation_text="±1 SD",
+                annotation_position="left"
+            )
+
+            if line is not None:
+                fig.add_hline(
+                    y=line,
+                    line_dash="dot",
+                    line_color="red",
+                    annotation_text=f"Line: {line}",
+                    annotation_position="right"
+                )
+
+            fig.update_layout(
+                xaxis_title="Games Ago",
+                yaxis_title=stat_type.capitalize(),
+                hovermode='x unified',
+                showlegend=True,
+                height=400
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Recent games table
+            st.subheader("Recent Games Details")
+            display_df = recent_stats[['date', 'opponent', 'is_home', 'days_rest', stat_type]].copy()
+            display_df['date'] = pd.to_datetime(display_df['date']).dt.strftime('%Y-%m-%d')
+            display_df['is_home'] = display_df['is_home'].map({True: 'Home', False: 'Away'})
+            display_df.columns = ['Date', 'Opponent', 'Home/Away', 'Days Rest', stat_type.capitalize()]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Betting analysis
+            if line is not None:
+                st.subheader("📊 Betting Analysis")
+
+                eval_result = predictor.evaluate_against_line(final_pred, weighted_std, line)
+
+                if eval_result:
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.markdown("#### Probabilities")
+                        prob_df = pd.DataFrame({
+                            'Outcome': ['OVER', 'UNDER'],
+                            'Probability': [
+                                f"{eval_result['prob_over']*100:.1f}%",
+                                f"{eval_result['prob_under']*100:.1f}%"
+                            ],
+                            'Expected Value': [
+                                f"{eval_result['ev_over']:.3f}",
+                                f"{eval_result['ev_under']:.3f}"
+                            ]
+                        })
+                        st.dataframe(prob_df, use_container_width=True, hide_index=True)
+
+                    with col2:
+                        st.markdown("#### Recommendation")
+                        recommendation = eval_result['recommendation']
+                        confidence = eval_result['confidence']
+
+                        if recommendation == 'OVER':
+                            st.success(f"**BET OVER {line}**")
+                        elif recommendation == 'UNDER':
+                            st.success(f"**BET UNDER {line}**")
+                        else:
+                            st.warning("**SKIP THIS BET**")
+
+                        st.metric(
+                            label="Confidence Level",
+                            value=f"{confidence:.2f} σ",
+                            help="Standard deviations from the line"
+                        )
+
+                        z_score = eval_result['z_score']
+                        if abs(z_score) >= 1.5:
+                            st.info("High confidence bet")
+                        elif abs(z_score) >= 1.0:
+                            st.info("Moderate confidence bet")
+                        else:
+                            st.warning("Low confidence - consider skipping")
+
+            predictor.close()
+
+# Footer
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: #666;'>
+    <p>Model uses exponentially weighted moving averages with defensive and rest adjustments</p>
+    <p>Always gamble responsibly. This is for educational purposes only.</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
