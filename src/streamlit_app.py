@@ -12,6 +12,7 @@ from multi_pick_analyzer import Pick, Parlay, MultiPickAnalyzer
 import numpy as np
 from datetime import datetime, timedelta
 from sqlalchemy import desc
+from scipy.stats import norm
 
 # Page configuration
 st.set_page_config(
@@ -26,6 +27,9 @@ if 'mode_selected' not in st.session_state:
 
 if 'parlay_picks' not in st.session_state:
     st.session_state.parlay_picks = []
+
+if 'parlay_result' not in st.session_state:
+    st.session_state.parlay_result = None
 
 # Helper functions
 @st.cache_data(ttl=3600)
@@ -123,7 +127,7 @@ if st.session_state.mode_selected is None:
     st.markdown("## Select Analysis Mode")
     st.markdown("---")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("### 📊 Player Analyzer")
@@ -137,6 +141,13 @@ if st.session_state.mode_selected is None:
         st.markdown("Build and analyze multi-player parlays with auto-calculated payouts and probabilities.")
         if st.button("🔮 Parlay Builder", use_container_width=True, type="primary", key="btn_parlay"):
             st.session_state.mode_selected = "parlay"
+            st.rerun()
+
+    with col3:
+        st.markdown("### 💰 Paper Trading")
+        st.markdown("Track your prediction accuracy with a $1000 simulated bankroll. View performance metrics and bankroll progression.")
+        if st.button("💸 Paper Trading", use_container_width=True, type="primary", key="btn_paper"):
+            st.session_state.mode_selected = "paper_trading"
             st.rerun()
 
 # ==========================================
@@ -432,6 +443,77 @@ elif st.session_state.mode_selected == "player":
                             else:
                                 st.warning("Low confidence - consider skipping")
 
+                        # Save as Paper Trade
+                        st.markdown("---")
+                        st.markdown("### 💾 Save as Paper Trade")
+
+                        col_save1, col_save2, col_save3 = st.columns([1, 2, 1])
+
+                        with col_save1:
+                            stake_input = st.number_input(
+                                "Stake Amount ($)",
+                                min_value=1.0,
+                                max_value=1000.0,
+                                value=10.0,
+                                step=1.0,
+                                key="player_stake"
+                            )
+
+                        with col_save2:
+                            direction_input = st.radio(
+                                "Direction",
+                                ["OVER", "UNDER"],
+                                horizontal=True,
+                                index=0 if recommendation == "OVER" else 1,
+                                key="player_direction"
+                            )
+
+                        with col_save3:
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            if st.button("💾 Save Bet", type="primary", use_container_width=True, key="save_player_bet"):
+                                from paper_trading import PaperTradingManager
+
+                                manager = PaperTradingManager()
+
+                                sufficient, available = manager.check_sufficient_funds(stake_input)
+                                if not sufficient:
+                                    st.error(f"Insufficient funds! Available: ${available:.2f}")
+                                else:
+                                    # Get player_id from database
+                                    from database import Player
+                                    session = manager.session
+                                    player = session.query(Player).filter_by(name=player_name).first()
+
+                                    if player:
+                                        # Calculate EV for the selected direction
+                                        prob = eval_result['prob_over'] if direction_input == 'OVER' else eval_result['prob_under']
+                                        potential_payout = stake_input * (100 / 110)  # -110 odds
+                                        ev = (prob * potential_payout) - ((1 - prob) * stake_input)
+
+                                        bet_id = manager.place_single_bet(
+                                            player_name=player_name,
+                                            stat_type=stat_type,
+                                            line=line,
+                                            direction=direction_input,
+                                            stake=stake_input,
+                                            prediction=final_pred,
+                                            probability=prob,
+                                            confidence=abs(z_score),
+                                            std_dev=weighted_std,
+                                            opponent=opponent_name,
+                                            days_rest=days_rest
+                                        )
+
+                                        if bet_id:
+                                            st.success(f"✅ Bet saved! Bet ID: {bet_id}")
+                                            st.balloons()
+                                        else:
+                                            st.error("Failed to save bet")
+                                    else:
+                                        st.error(f"Player {player_name} not found in database")
+
+                                manager.close()
+
                 predictor.close()
 
 # ==========================================
@@ -664,125 +746,227 @@ elif st.session_state.mode_selected == "parlay":
 
                 predictor.close()
 
-                # Display results
-                st.markdown("---")
-                st.markdown("## 📊 Parlay Analysis Results")
+                # Store result in session state
+                st.session_state.parlay_result = result
 
-                if result.recommendation and "BET" in result.recommendation:
-                    st.success(f"✅ {result.recommendation}")
+        # Display results if they exist
+        if st.session_state.parlay_result is not None:
+            result = st.session_state.parlay_result
+
+            # Recreate opponent_map and rest_map from session state
+            opponent_map = {}
+            rest_map = {}
+            for config in st.session_state.parlay_picks:
+                if config['opponent']:
+                    opponent_map[config['player']] = config['opponent']
+                if config['days_rest'] is not None:
+                    rest_map[config['player']] = config['days_rest']
+
+            st.markdown("---")
+            st.markdown("## 📊 Parlay Analysis Results")
+
+            if result.recommendation and "BET" in result.recommendation:
+                st.success(f"✅ {result.recommendation}")
+            else:
+                st.error(f"❌ {result.recommendation}")
+
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+
+            with metric_col1:
+                st.metric(
+                    "Parlay Probability",
+                    f"{result.parlay_probability*100:.1f}%",
+                    help="Probability all picks hit"
+                )
+
+            with metric_col2:
+                st.metric(
+                    "Expected Value",
+                    f"${result.expected_value:.2f}",
+                    delta=f"{result.roi:.1f}% ROI",
+                    help="Expected profit/loss per bet"
+                )
+
+            with metric_col3:
+                if result.payout_multiplier > 1 and result.parlay_probability:
+                    kelly_fraction = (result.parlay_probability * result.payout_multiplier - 1) / (result.payout_multiplier - 1)
+                    quarter_kelly = max(0, kelly_fraction * 0.25 * 100)
                 else:
-                    st.error(f"❌ {result.recommendation}")
+                    quarter_kelly = 0
 
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                st.metric(
+                    "Quarter Kelly",
+                    f"{quarter_kelly:.1f}%",
+                    help="Recommended bet size (% of bankroll)"
+                )
 
-                with metric_col1:
-                    st.metric(
-                        "Parlay Probability",
-                        f"{result.parlay_probability*100:.1f}%",
-                        help="Probability all picks hit"
-                    )
+            with metric_col4:
+                potential_payout = stake * payout_multiplier
+                potential_profit = potential_payout - stake
 
-                with metric_col2:
-                    st.metric(
-                        "Expected Value",
-                        f"${result.expected_value:.2f}",
-                        delta=f"{result.roi:.1f}% ROI",
-                        help="Expected profit/loss per bet"
-                    )
+                st.metric(
+                    "Potential Profit",
+                    f"${potential_profit:.2f}",
+                    delta=f"{payout_multiplier}x",
+                    help="Profit if parlay hits"
+                )
 
-                with metric_col3:
-                    if result.payout_multiplier > 1 and result.parlay_probability:
-                        kelly_fraction = (result.parlay_probability * result.payout_multiplier - 1) / (result.payout_multiplier - 1)
-                        quarter_kelly = max(0, kelly_fraction * 0.25 * 100)
-                    else:
-                        quarter_kelly = 0
+            # Individual pick breakdown
+            st.markdown("### 📈 Individual Pick Breakdown")
 
-                    st.metric(
-                        "Quarter Kelly",
-                        f"{quarter_kelly:.1f}%",
-                        help="Recommended bet size (% of bankroll)"
-                    )
+            pick_data = []
+            for pick in result.picks:
+                if pick.prediction is not None and pick.probability is not None:
+                    edge = pick.prediction - pick.line if pick.direction == "OVER" else pick.line - pick.prediction
+                    pick_data.append({
+                        "Player": pick.player_name,
+                        "Stat": pick.stat_type.upper(),
+                        "Line": pick.line,
+                        "Direction": pick.direction,
+                        "Prediction": f"{pick.prediction:.2f}",
+                        "Probability": f"{pick.probability*100:.1f}%",
+                        "Edge": f"{edge:+.2f}"
+                    })
 
-                with metric_col4:
-                    potential_payout = stake * payout_multiplier
-                    potential_profit = potential_payout - stake
+            if pick_data:
+                df = pd.DataFrame(pick_data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
-                    st.metric(
-                        "Potential Profit",
-                        f"${potential_profit:.2f}",
-                        delta=f"{payout_multiplier}x",
-                        help="Profit if parlay hits"
-                    )
+            # Adjustments
+            if opponent_map or rest_map:
+                st.markdown("### ⚙️ Adjustments Applied")
 
-                # Individual pick breakdown
-                st.markdown("### 📈 Individual Pick Breakdown")
-
-                pick_data = []
+                adj_data = []
                 for pick in result.picks:
-                    if pick.prediction is not None and pick.probability is not None:
-                        edge = pick.prediction - pick.line if pick.direction == "OVER" else pick.line - pick.prediction
-                        pick_data.append({
+                    adjustments = []
+                    if pick.player_name in opponent_map:
+                        adjustments.append(f"Opponent: {opponent_map[pick.player_name]}")
+                    if pick.player_name in rest_map:
+                        days = rest_map[pick.player_name]
+                        rest_desc = {
+                            0: "Back-to-back",
+                            1: "1 day rest",
+                            2: "2 days rest (optimal)",
+                            3: "3 days rest"
+                        }.get(days, f"{days} days rest")
+                        adjustments.append(f"Rest: {rest_desc}")
+
+                    if adjustments:
+                        adj_data.append({
                             "Player": pick.player_name,
-                            "Stat": pick.stat_type.upper(),
-                            "Line": pick.line,
-                            "Direction": pick.direction,
-                            "Prediction": f"{pick.prediction:.2f}",
-                            "Probability": f"{pick.probability*100:.1f}%",
-                            "Edge": f"{edge:+.2f}"
+                            "Adjustments": ", ".join(adjustments)
                         })
 
-                if pick_data:
-                    df = pd.DataFrame(pick_data)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                if adj_data:
+                    adj_df = pd.DataFrame(adj_data)
+                    st.dataframe(adj_df, use_container_width=True, hide_index=True)
 
-                # Adjustments
-                if opponent_map or rest_map:
-                    st.markdown("### ⚙️ Adjustments Applied")
+            # Explanation
+            with st.expander("📖 How is Parlay Probability Calculated?"):
+                st.markdown("**Individual Probabilities:**")
+                for i, pick in enumerate(result.picks, 1):
+                    if pick.probability:
+                        st.write(f"- Pick {i} ({pick.player_name} {pick.stat_type.upper()} {pick.direction} {pick.line}): {pick.probability*100:.1f}%")
 
-                    adj_data = []
-                    for pick in result.picks:
-                        adjustments = []
-                        if pick.player_name in opponent_map:
-                            adjustments.append(f"Opponent: {opponent_map[pick.player_name]}")
-                        if pick.player_name in rest_map:
-                            days = rest_map[pick.player_name]
-                            rest_desc = {
-                                0: "Back-to-back",
-                                1: "1 day rest",
-                                2: "2 days rest (optimal)",
-                                3: "3 days rest"
-                            }.get(days, f"{days} days rest")
-                            adjustments.append(f"Rest: {rest_desc}")
+                st.markdown(f"""
+                **Parlay Probability (assuming independence):**
 
-                        if adjustments:
-                            adj_data.append({
-                                "Player": pick.player_name,
-                                "Adjustments": ", ".join(adjustments)
-                            })
+                = {" × ".join([f"{p.probability*100:.1f}%" for p in result.picks if p.probability])}
+                = **{result.parlay_probability*100:.1f}%**
 
-                    if adj_data:
-                        adj_df = pd.DataFrame(adj_data)
-                        st.dataframe(adj_df, use_container_width=True, hide_index=True)
+                **Expected Value:**
 
-                # Explanation
-                with st.expander("📖 How is Parlay Probability Calculated?"):
-                    st.markdown("**Individual Probabilities:**")
-                    for i, pick in enumerate(result.picks, 1):
-                        if pick.probability:
-                            st.write(f"- Pick {i} ({pick.player_name} {pick.stat_type.upper()} {pick.direction} {pick.line}): {pick.probability*100:.1f}%")
+                = (Probability × Payout) - ((1 - Probability) × Stake)
+                = ({result.parlay_probability:.3f} × ${stake * payout_multiplier:.2f}) - ({1 - result.parlay_probability:.3f} × ${stake:.2f})
+                = **${result.expected_value:.2f}**
+                """)
 
-                    st.markdown(f"""
-                    **Parlay Probability (assuming independence):**
+            # Save Parlay as Paper Trade
+            st.markdown("---")
+            st.markdown("### 💾 Save Parlay as Paper Trade")
 
-                    = {" × ".join([f"{p.probability*100:.1f}%" for p in result.picks if p.probability])}
-                    = **{result.parlay_probability*100:.1f}%**
+            col_parlay1, col_parlay2 = st.columns([3, 1])
 
-                    **Expected Value:**
+            with col_parlay1:
+                st.info(f"This {num_picks}-leg parlay will use the stake of ${stake:.2f} and {payout_multiplier}x multiplier configured above.")
 
-                    = (Probability × Payout) - ((1 - Probability) × Stake)
-                    = ({result.parlay_probability:.3f} × ${stake * payout_multiplier:.2f}) - ({1 - result.parlay_probability:.3f} × ${stake:.2f})
-                    = **${result.expected_value:.2f}**
-                    """)
+            with col_parlay2:
+                if st.button("💾 Save Parlay", type="primary", use_container_width=True, key="save_parlay_bet"):
+                    from paper_trading import PaperTradingManager
+
+                    manager = PaperTradingManager()
+
+                    sufficient, available = manager.check_sufficient_funds(stake)
+                    if not sufficient:
+                        st.error(f"Insufficient funds! Available: ${available:.2f}")
+                    else:
+                        # Prepare picks data
+                        picks_data = []
+                        for pick in result.picks:
+                            # Get player_id from database
+                            from database import Player
+                            session = manager.session
+                            player = session.query(Player).filter_by(name=pick.player_name).first()
+
+                            if player and pick.prediction is not None and pick.probability is not None:
+                                # Find the corresponding config to get rest/opponent info
+                                config = next((c for c in st.session_state.parlay_picks if c['player'] == pick.player_name and c['stat_type'] == pick.stat_type), None)
+
+                                # Calculate confidence using z-score from normal distribution
+                                # Using inverse CDF to get z-score from probability
+                                if pick.direction == "OVER":
+                                    z_score = abs(norm.ppf(1 - pick.probability)) if pick.probability < 1 else 3.0
+                                else:
+                                    z_score = abs(norm.ppf(1 - pick.probability)) if pick.probability < 1 else 3.0
+
+                                picks_data.append({
+                                    'player_id': player.id,
+                                    'player_name': pick.player_name,
+                                    'stat_type': pick.stat_type,
+                                    'line': pick.line,
+                                    'direction': pick.direction,
+                                    'prediction': pick.prediction,
+                                    'probability': pick.probability,
+                                    'confidence': z_score,
+                                    'opponent': config['opponent'] if config else None,
+                                    'days_rest': config['days_rest'] if config else None
+                                })
+
+                        if len(picks_data) == len(result.picks):
+                            try:
+                                parlay_id = manager.place_parlay_bet(
+                                    picks_data=picks_data,
+                                    stake=stake,
+                                    payout_multiplier=payout_multiplier,
+                                    parlay_probability=result.parlay_probability,
+                                    expected_value=result.expected_value
+                                )
+
+                                if parlay_id:
+                                    st.success(f"✅ Parlay saved! Parlay ID: {parlay_id}")
+                                    st.balloons()
+                                else:
+                                    st.error("Failed to save parlay - check console for details")
+                            except Exception as e:
+                                st.error(f"Error saving parlay: {str(e)}")
+                                import traceback
+                                st.code(traceback.format_exc())
+                        else:
+                            st.error(f"Error: Some players not found in database. Found {len(picks_data)}/{len(result.picks)} players")
+
+                    manager.close()
+
+# ==========================================
+# PAPER TRADING MODE
+# ==========================================
+elif st.session_state.mode_selected == "paper_trading":
+    # Back button
+    if st.sidebar.button("← Back to Mode Selection"):
+        st.session_state.mode_selected = None
+        st.rerun()
+
+    from paper_trading_ui import render_paper_trading_mode
+    render_paper_trading_mode()
 
 # Footer
 st.markdown("---")
